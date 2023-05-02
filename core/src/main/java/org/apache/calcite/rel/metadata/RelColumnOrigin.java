@@ -31,6 +31,8 @@ public class RelColumnOrigin {
 
   private final boolean isDerived;
 
+  private String transform;
+
   //~ Constructors -----------------------------------------------------------
 
   public RelColumnOrigin(
@@ -40,6 +42,17 @@ public class RelColumnOrigin {
     this.originTable = originTable;
     this.iOriginColumn = iOriginColumn;
     this.isDerived = isDerived;
+  }
+
+  public RelColumnOrigin(
+      RelOptTable originTable,
+      int iOriginColumn,
+      boolean isDerived,
+      String transform) {
+    this.originTable = originTable;
+    this.iOriginColumn = iOriginColumn;
+    this.isDerived = isDerived;
+    this.transform = transform;
   }
 
   //~ Methods ----------------------------------------------------------------
@@ -86,4 +99,10 @@ public class RelColumnOrigin {
     return originTable.getQualifiedName().hashCode()
         + iOriginColumn + (isDerived ? 313 : 0);
   }
+
+  // get transform
+  public String getTransform() {
+    return transform;
+  }
+
 }
