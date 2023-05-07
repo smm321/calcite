@@ -21,6 +21,7 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.core.Correlate;
 import org.apache.calcite.rel.core.Exchange;
 import org.apache.calcite.rel.core.Filter;
@@ -37,26 +38,21 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexFieldAccess;
 import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexLocalRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexPatternFieldRef;
+import org.apache.calcite.rex.RexShuttle;
 import org.apache.calcite.rex.RexVisitor;
 import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.util.BuiltInMethod;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.function.Function;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 /**
  * RelMdColumnOrigins supplies a default implementation of
@@ -174,12 +170,7 @@ public class RelMdColumnOrigins
        * otherwise the return is null, and the UDTF field origin cannot be parsed
        */
       set = mq.getColumnOrigins(rel.getLeft(), leftFieldIndex);
-
-      // process transform for udtf
-      String transform = rexCall.toString().replace(rexFieldAccess.toString(), fieldName)
-          + DELIMITER
-          + tableFunctionScan.getRowType().getFieldNames().get(iOutputColumn - nLeftColumns);
-      set = createDerivedColumnOrigins(set, transform, false);
+      set = createDerivedColumnOrigins(set);
     }
     return set;
   }
@@ -239,11 +230,32 @@ public class RelMdColumnOrigins
     RexPatternFieldRef rexPatternFieldRef = searchRexPatternFieldRef(rexNode);
     if (rexPatternFieldRef != null) {
       final Set<RelColumnOrigin> set = mq.getColumnOrigins(input, rexPatternFieldRef.getIndex());
-      String originTransform = rexNode instanceof RexCall ? ((RexCall) rexNode).getOperands()
-          .get(0).toString() : null;
-      return createDerivedColumnOrigins(set, originTransform, true);
+      return createDerivedColumnOrigins(set);
     }
     return Collections.emptySet();
+  }
+
+  public Set<RelColumnOrigin> getColumnOrigins(Calc rel,
+      final RelMetadataQuery mq, int iOutputColumn) {
+    final RelNode input = rel.getInput();
+    final RexShuttle rexShuttle = new RexShuttle() {
+      @Override
+      public RexNode visitLocalRef(RexLocalRef localRef) {
+        return rel.getProgram().expandLocalRef(localRef);
+      }
+    };
+
+    List<RexNode> projects = new ArrayList<>(rexShuttle.apply(rel.getProgram().getProjectList()));
+
+    final RexNode rexNode = projects.get(iOutputColumn);
+    if (rexNode instanceof RexInputRef) {
+      // Direct reference:  no derivation added.
+      RexInputRef inputRef = (RexInputRef) rexNode;
+      return mq.getColumnOrigins(input, inputRef.getIndex());
+    }
+    // Anything else is a derivation, possibly from multiple columns.
+    final Set<RelColumnOrigin> set = getMultipleColumns(rexNode, input, mq);
+    return createDerivedColumnOrigins(set);
   }
 
   private RexPatternFieldRef searchRexPatternFieldRef(RexNode rexNode) {
@@ -415,103 +427,5 @@ public class RelMdColumnOrigins
         };
     rexNode.accept(visitor);
     return set;
-  }
-
-  private Set<RelColumnOrigin> createDerivedColumnOrigins(
-      Set<RelColumnOrigin> inputSet, String transform, boolean originTransform) {
-    if (inputSet == null || inputSet.isEmpty()) {
-      return Collections.emptySet();
-    }
-    final Set<RelColumnOrigin> set = new LinkedHashSet<>();
-
-    String finalTransform = originTransform ? computeTransform(inputSet, transform) : transform;
-    for (RelColumnOrigin rco : inputSet) {
-      RelColumnOrigin derived =
-          new RelColumnOrigin(
-              rco.getOriginTable(),
-              rco.getOriginColumnOrdinal(),
-              true,
-              finalTransform);
-      set.add(derived);
-    }
-    return set;
-  }
-
-  /**
-   * Replace the variable at the beginning of $ in input with the real field information.
-   */
-  private String computeTransform(Set<RelColumnOrigin> inputSet, String transform) {
-    Pattern pattern = Pattern.compile("\\$\\d+");
-    Matcher matcher = pattern.matcher(transform);
-
-    Set<String> operandSet = new LinkedHashSet<>();
-    while (matcher.find()) {
-      operandSet.add(matcher.group());
-    }
-
-    if (operandSet.isEmpty()) {
-      return null;
-    }
-    if (inputSet.size() != operandSet.size()) {
-      return null;
-    }
-
-    Map<String, String> sourceColumnMap = new HashMap<>();
-    Iterator<String> iterator = optimizeSourceColumnSet(inputSet).iterator();
-    operandSet.forEach(e -> sourceColumnMap.put(e, iterator.next()));
-
-    matcher = pattern.matcher(transform);
-    String temp;
-    while (matcher.find()) {
-      temp = matcher.group();
-      transform = transform.replace(temp, sourceColumnMap.get(temp));
-    }
-
-    // temporary special treatment
-    transform = transform.replace("_UTF-16LE", "");
-    return transform;
-  }
-
-  /**
-   * Increase the readability of transform.
-   * if catalog, database and table are the same, return field.
-   * If the catalog and database are the same, return the table and field.
-   * If the catalog is the same, return the database, table, field.
-   * Otherwise, return all
-   */
-  private Set<String> optimizeSourceColumnSet(Set<RelColumnOrigin> inputSet) {
-    Set<String> catalogSet = new HashSet<>();
-    Set<String> databaseSet = new HashSet<>();
-    Set<String> tableSet = new HashSet<>();
-    Set<List<String>> qualifiedSet = new LinkedHashSet<>();
-    for (RelColumnOrigin rco : inputSet) {
-      RelOptTable originTable = rco.getOriginTable();
-      List<String> qualifiedName = originTable.getQualifiedName();
-
-      // catalog,database,table,field
-      List<String> qualifiedList = new ArrayList<>(qualifiedName);
-      catalogSet.add(qualifiedName.get(0));
-      databaseSet.add(qualifiedName.get(1));
-      tableSet.add(qualifiedName.get(2));
-
-      String field = rco.getTransform() != null ? rco.getTransform()
-          : originTable.getRowType().getFieldNames().get(rco.getOriginColumnOrdinal());
-      qualifiedList.add(field);
-      qualifiedSet.add(qualifiedList);
-    }
-    if (catalogSet.size() == 1 && databaseSet.size() == 1 && tableSet.size() == 1) {
-      return optimizeName(qualifiedSet, e -> e.get(3));
-    } else if (catalogSet.size() == 1 && databaseSet.size() == 1) {
-      return optimizeName(qualifiedSet, e -> String.join(DELIMITER, e.subList(2, 4)));
-    } else if (catalogSet.size() == 1) {
-      return optimizeName(qualifiedSet, e -> String.join(DELIMITER, e.subList(1, 4)));
-    } else {
-      return optimizeName(qualifiedSet, e -> String.join(DELIMITER, e));
-    }
-  }
-
-  private Set<String> optimizeName(Set<List<String>> qualifiedSet, Function<List<String>,
-      String> mapper) {
-    return qualifiedSet.stream().map(mapper).collect(Collectors.toSet());
   }
 }
