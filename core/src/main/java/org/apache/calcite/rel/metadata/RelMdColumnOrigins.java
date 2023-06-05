@@ -44,7 +44,11 @@ import org.apache.calcite.rex.RexPatternFieldRef;
 import org.apache.calcite.rex.RexShuttle;
 import org.apache.calcite.rex.RexVisitor;
 import org.apache.calcite.rex.RexVisitorImpl;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.util.BuiltInMethod;
+
+import org.apache.commons.lang3.StringUtils;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -334,7 +338,20 @@ public class RelMdColumnOrigins
         // This is a non-leaf transformation:  say we don't
         // know about origins, because there are probably
         // columns below.
-        return Collections.emptySet();
+        RexCall rexCall = (RexCall)rel.getCall();
+        if (!StringUtils.containsAny(rexCall.getOperator().getName(),
+            "CUMULATE", SqlKind.HOP.name(), SqlKind.TUMBLE.name())) {
+          return Collections.emptySet();
+        }
+
+        int rowTypeColumns = rel.getInput(0).getRowType().getFieldList().size();
+        if (iOutputColumn < rowTypeColumns) {
+          return mq.getColumnOrigins(rel.getInput(0), iOutputColumn);
+        } else {
+          RexInputRef inputRef = (RexInputRef)rexCall.getOperands().get(0);
+          int index = inputRef.getIndex();
+          return mq.getColumnOrigins(rel.getInput(0), index);
+        }
       } else {
         // This is a leaf transformation: say there are fer sure no
         // column origins.
